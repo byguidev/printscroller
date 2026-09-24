@@ -108,16 +108,26 @@ namespace PrintScroller
 
         /// <summary>
         /// Reforça a confiança no deslocamento candidato comparando uma segunda faixa,
-        /// bem separada da primeira, no mesmo deslocamento. Se não houver espaço sobrando
-        /// em "reference" para essa segunda faixa (deslocamento grande demais), confia só
-        /// na primeira faixa — é uma situação de captura maior/mais rara, já no limite do
-        /// que dá para verificar.
+        /// separada da primeira, no mesmo deslocamento. O espaço disponível para essa
+        /// segunda faixa encolhe conforme o deslocamento cresce (a sobreposição entre
+        /// "current" e "reference" é menor); por isso a posição da faixa é escolhida
+        /// dinamicamente, usando o máximo de separação que ainda couber, em vez de uma
+        /// posição fixa. Isso mantém a verificação ativa mesmo em rolagens rápidas
+        /// (deslocamentos grandes) — exatamente quando ela é mais necessária. Só quando
+        /// nem uma separação mínima cabe (deslocamento já quase no limite físico de
+        /// busca) é que se confia na primeira faixa sozinha.
         /// </summary>
         private static bool ConfirmWithSecondBand(byte[] referenceGray, byte[] currentGray, int width, int height,
             int offset, int bandHeight, int columnStep, int errorThreshold)
         {
-            int probeRow = bandHeight + 40;
-            if (probeRow + bandHeight + offset > height) return true;
+            const int PreferredGap = 40;
+            const int MinGap = 8;
+
+            int maxProbeRow = height - offset - bandHeight;
+            int minProbeRow = bandHeight + MinGap;
+            if (maxProbeRow < minProbeRow) return true;
+
+            int probeRow = Math.Min(bandHeight + PreferredGap, maxProbeRow);
             if (!HasEnoughContrast(currentGray, width, probeRow, bandHeight, columnStep)) return true;
 
             double error = BandError(referenceGray, probeRow + offset, currentGray, probeRow, width, bandHeight, columnStep);
