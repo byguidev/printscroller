@@ -7,7 +7,13 @@ using System.Windows.Forms;
 
 namespace PrintScroller
 {
-    internal sealed class CaptureApplicationContext : ApplicationContext
+    /// <summary>
+    /// Uma captura em andamento, da seleção da área até o ENTER que finaliza e salva.
+    /// É dona apenas dos recursos daquela captura específica (timer, moldura visual,
+    /// hook do ENTER); o NotifyIcon é compartilhado e pertence ao TrayApplicationContext,
+    /// que sobrevive entre uma captura e outra.
+    /// </summary>
+    internal sealed class CaptureSession : IDisposable
     {
         private const int PollIntervalMs = 120;
         private const int ColumnStep = 3;
@@ -19,10 +25,13 @@ namespace PrintScroller
         private readonly System.Windows.Forms.Timer _timer;
         private readonly GlobalKeyboardHook _hook;
         private readonly NotifyIcon _trayIcon;
+        private readonly SelectionBorderOverlay _borderOverlay;
         private readonly List<Bitmap> _segments = new();
+        private readonly Action _onFinished;
 
         private byte[]? _referenceGray;
         private bool _finished;
+        private bool _disposed;
         private int _tickCount;
 
         private static readonly string LogPath = Path.Combine(Path.GetTempPath(), "printscroller_debug.log");
@@ -33,21 +42,21 @@ namespace PrintScroller
             catch { /* diagnostics only */ }
         }
 
-        public CaptureApplicationContext(Rectangle region)
+        public CaptureSession(Rectangle region, NotifyIcon trayIcon, Action onFinished)
         {
             _region = region;
+            _trayIcon = trayIcon;
+            _onFinished = onFinished;
             Log($"=== nova captura, região={region.Width}x{region.Height} @ ({region.X},{region.Y}) ===");
 
             var first = CaptureRegion();
             _segments.Add(first);
             SetReference(first);
 
-            _trayIcon = new NotifyIcon
-            {
-                Icon = SystemIcons.Application,
-                Visible = true,
-                Text = "PrintScroller - role a tela; ENTER finaliza"
-            };
+            _borderOverlay = new SelectionBorderOverlay(region);
+            _borderOverlay.Show();
+
+            _trayIcon.Text = "PrintScroller - capturando: role a tela; ENTER finaliza";
 
             _hook = new GlobalKeyboardHook();
             _hook.EnterPressed += OnEnterPressed;
@@ -82,16 +91,16 @@ namespace PrintScroller
             _timer.Stop();
             _hook.EnterPressed -= OnEnterPressed;
             _hook.Dispose();
+            _borderOverlay.Close();
 
             // Mesma lógica do polling normal: pega o que houver de novo desde o
             // último segmento costurado, mesmo que seja uma rolagem incompleta.
             TryCommitNewContent("ENTER");
             Log($"FIM: {_segments.Count} segmento(s) no total");
 
-            _trayIcon.Visible = false;
-            _trayIcon.Dispose();
-
             SaveResult();
+
+            _onFinished();
         }
 
         /// <summary>
@@ -120,6 +129,12 @@ namespace PrintScroller
         {
             using var final = ImageMath.StitchVertically(_segments, _region.Width);
             foreach (var seg in _segments) seg.Dispose();
+            _segments.Clear();
+
+            // O ENTER é capturado por um hook de teclado, não por RegisterHotKey, então
+            // não ganha o direito automático de ir para o primeiro plano: sem isso, o
+            // diálogo abriria atrás da janela ativa do usuário, sem ele perceber.
+            using var owner = ForegroundHelper.CreateForegroundOwner();
 
             using var dlg = new SaveFileDialog
             {
@@ -129,14 +144,49 @@ namespace PrintScroller
                 InitialDirectory = Environment.GetFolderPath(Environment.SpecialFolder.MyPictures)
             };
 
-            if (dlg.ShowDialog() == DialogResult.OK)
+            if (dlg.ShowDialog(owner) == DialogResult.OK)
             {
                 final.Save(dlg.FileName, ImageFormat.Png);
-                MessageBox.Show($"Captura salva em:\n{dlg.FileName}", "PrintScroller",
+                MessageBox.Show(owner, $"Captura salva em:\n{dlg.FileName}", "PrintScroller",
                     MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
+        }
 
-            ExitThread();
+        /// <summary>
+        /// Interrompe a captura sem salvar. Usado quando o atalho de matar o programa
+        /// é pressionado no meio de uma captura em andamento.
+        /// </summary>
+        public void Abort()
+        {
+            if (_finished) return;
+            _finished = true;
+
+            _timer.Stop();
+            _hook.EnterPressed -= OnEnterPressed;
+            _hook.Dispose();
+            _borderOverlay.Close();
+
+            foreach (var seg in _segments) seg.Dispose();
+            _segments.Clear();
+
+            Log("ABORTADO (atalho de sair pressionado durante a captura)");
+        }
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+
+            _timer.Dispose();
+            if (!_finished)
+            {
+                _hook.EnterPressed -= OnEnterPressed;
+                _hook.Dispose();
+            }
+            _borderOverlay.Dispose();
+
+            foreach (var seg in _segments) seg.Dispose();
+            _segments.Clear();
         }
     }
 }
